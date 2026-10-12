@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-editor"
+version = "0.1.0"
+description = "Scan a folder of footage, score every segment for focus, motion and exposure, and export a selects timeline for Resolve, Premiere or Final Cut."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+ai-editor = "ai_editor.cli:main"
+
+[tool.setuptools]
+packages = ["ai_editor"]
