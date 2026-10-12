@@ -54,6 +54,8 @@ sips -g pixelWidth -g pixelHeight <image>               # image details without 
 
 ## Rules
 
+- Premiere: only Adobe Premiere Pro 2026, never anything named "Beta" (another session uses it). Never quit a running Premiere.
+
 - Never Read a raw video/audio file. The guard hook blocks it and tells you which command to run.
 - Don't open full-res images just to check size, format, or count. Use the summary table or `sips`.
 - Quote the summary's token estimate when you report back, so the saving is visible.
