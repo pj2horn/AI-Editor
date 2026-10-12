@@ -112,7 +112,9 @@ def analyze_folder(
     recursive: bool = True,
     force: bool = False,
     log=lambda msg: print(msg, file=sys.stderr),
+    progress=None,
 ) -> list[ClipAnalysis]:
+    """`progress(done, total, name)` is called as each clip finishes (cached clips count as done)."""
     folder = folder.resolve()
     cache_path = cache_path or folder / CACHE_NAME
     settings = {"sample_fps": sample_fps, "width": width}
@@ -134,6 +136,8 @@ def analyze_folder(
         else:
             todo.append(p)
 
+    if progress:
+        progress(len(results), len(paths), "")
     if todo:
         log(f"Analysing {len(todo)} clip(s) ({len(results)} cached)...")
 
@@ -152,6 +156,8 @@ def analyze_folder(
                 log(f"  [{n}/{len(todo)}] {p.name}")
             except Exception as e:  # keep going; one bad file shouldn't sink the batch
                 log(f"  [{n}/{len(todo)}] skipped {p.name}: {e}")
+            if progress:
+                progress(len(paths) - len(todo) + n, len(paths), p.name)
 
     ordered = [results[str(p.resolve())] for p in paths if str(p.resolve()) in results]
     try:

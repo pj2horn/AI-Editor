@@ -12,7 +12,21 @@ Requires Python 3.10+ and `ffmpeg`/`ffprobe` on your `PATH`.
 pip install -e .            # or: pip install -e '.[dev]' to run the tests
 ```
 
-## Use
+## Web interface
+
+```bash
+ai-editor ui ~/Footage/Shoot01      # opens http://127.0.0.1:8765
+```
+
+- **Weights triangle.** Drag the handle toward Focus, Motion or Exposure, or pick a preset: All-rounder, Action / Sport, Talking head or Locked-off. Arrow keys also move it.
+- **Score chart.** Every segment in the shoot, plotted by score. Kept segments are green and dropped ones are grey. Hover a point for a thumbnail and sub-scores, and click it to preview. Drag the dashed line to set the minimum score.
+- **Parameters.** Segment length, max segments per clip, minimum score, target length and timeline order. Changes apply instantly, with no re-analysis.
+- **Selects timeline and clip detail.** The finished stringout at a glance, plus focus, motion and exposure over time for the clip you're looking at.
+- **Export.** Resolve / FCP (`.fcpxml`), Premiere (`.xml`), EDL or CSV, straight from the footer.
+
+The server only listens on localhost. Previews use your browser's own decoder, so H.264 and HEVC play, and ProRes or DNx clips fall back to a still frame. Keyboard shortcuts: `J`/`K` (or ←/→) step through the selects, and Space plays or pauses.
+
+## Command line
 
 ```bash
 # Analyse once (cached in FOLDER/.ai-editor-cache.json)

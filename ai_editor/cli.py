@@ -102,6 +102,12 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_ui(args) -> int:
+    from .server import serve
+    serve(args.folder, port=args.port, open_browser=not args.no_browser)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ai-editor", description="Score every segment of your footage and export a selects timeline.")
     parser.add_argument("--version", action="version", version=f"ai-editor {__version__}")
@@ -130,6 +136,12 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--fps", help="timeline frame rate, e.g. 25 or 30000/1001 (default: most common)")
             p.add_argument("--name", help="timeline name (default: output file name)")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("ui", help="open the web interface")
+    p.add_argument("folder", nargs="?", help="footage folder to analyse on launch")
+    p.add_argument("--port", type=int, default=8765, help="port (default 8765, 0 = any free port)")
+    p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    p.set_defaults(func=cmd_ui)
 
     args = parser.parse_args(argv)
     try:

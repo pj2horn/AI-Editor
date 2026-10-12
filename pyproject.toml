@@ -18,3 +18,6 @@ ai-editor = "ai_editor.cli:main"
 
 [tool.setuptools]
 packages = ["ai_editor"]
+
+[tool.setuptools.package-data]
+ai_editor = ["web/*.html"]
