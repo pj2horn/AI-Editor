@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# prep-images — a folder of stills (frame grabs, refs, selects) -> at most two
+# labeled contact sheets + a one-line-per-file table, so Claude reads 2 images
+# instead of 40.
+#
+# Usage: prep-images <folder | files...> [-o out_dir]
+# Output (default ./.prep/<folder name>/): summary.md, sheet-1.jpg[, sheet-2.jpg]
+#
+# Needs ffmpeg/ffprobe. On macOS, RAW/HEIC files are converted with sips first.
+
+set -euo pipefail
+die() { echo "prep-images: $*" >&2; exit 1; }
+command -v ffmpeg >/dev/null || die "needs ffmpeg + ffprobe (brew install ffmpeg)"
+
+OUT=""; ARGS=()
+while [ $# -gt 0 ]; do
+  case $1 in -o) OUT=$2; shift 2 ;; *) ARGS+=("$1"); shift ;; esac
+done
+[ ${#ARGS[@]} -gt 0 ] || die "usage: prep-images <folder | files...> [-o out_dir]"
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+EXT='jpg|jpeg|png|tif|tiff|webp|bmp|heic|heif|dng|cr2|cr3|nef|arw|raf|orf|rw2'
+LIST=$TMP/list
+if [ ${#ARGS[@]} -eq 1 ] && [ -d "${ARGS[0]}" ]; then
+  find "${ARGS[0]}" -maxdepth 1 -type f | grep -iE "\.($EXT)$" | sort >"$LIST" || true
+  LABEL=$(basename "$(cd "${ARGS[0]}" && pwd)")
+else
+  printf '%s\n' "${ARGS[@]}" >"$LIST"; LABEL=images
+fi
+OUT=${OUT:-./.prep/$LABEL}; mkdir -p "$OUT"; rm -f "$OUT"/sheet-*.jpg
+TOTAL=$(wc -l <"$LIST" | tr -d ' ')
+[ "$TOTAL" -gt 0 ] || die "no images found"
+
+PER=20; COLS=5; TW=300; TH=300      # 5x4 grid of 300px cells ~= 1520x1240
+MAX=$((PER * 2))
+
+: >"$TMP/table"
+i=0
+while read -r f; do
+  i=$((i + 1)); n=$(printf %03d "$i")
+  src=$f
+  ext=$(echo "${f##*.}" | tr '[:upper:]' '[:lower:]')
+  case $ext in heic|heif|dng|cr2|cr3|nef|arw|raf|orf|rw2)
+    if command -v sips >/dev/null; then
+      sips -s format jpeg -Z 1200 "$f" --out "$TMP/conv_$n.jpg" >/dev/null 2>&1 && src=$TMP/conv_$n.jpg
+    fi ;;
+  esac
+  dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$src" 2>/dev/null | head -1)
+  kb=$(( $(wc -c <"$f" | tr -d ' ') / 1024 ))
+  printf '| %d | %s | %s | %s KB |\n' "$i" "$(basename "$f")" "${dims:-unreadable}" "$kb" >>"$TMP/table"
+  [ "$i" -le "$MAX" ] || continue
+  [ -n "$dims" ] || continue
+  vf="scale=$TW:$TH:force_original_aspect_ratio=decrease,pad=$TW:$TH:(ow-iw)/2:(oh-ih)/2:color=black"
+  lab="$vf,drawtext=text='$i':x=6:y=6:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=4"
+  ffmpeg -nostdin -v error -i "$src" -frames:v 1 -vf "$lab" "$TMP/t_$n.png" -y 2>/dev/null ||
+    ffmpeg -nostdin -v error -i "$src" -frames:v 1 -vf "$vf" "$TMP/t_$n.png" -y
+done <"$LIST"
+
+# Renumber tiles contiguously, then tile in pages of PER.
+k=0; for t in "$TMP"/t_*.png; do [ -e "$t" ] || continue; k=$((k + 1)); mv "$t" "$TMP/s_$(printf %03d $k).png"; done
+SHEETS=0
+for page in 1 2; do
+  start=$(( (page - 1) * PER + 1 )); [ "$start" -le "$k" ] || break
+  cnt=$(( k - start + 1 )); [ "$cnt" -gt "$PER" ] && cnt=$PER
+  c=$COLS; [ "$cnt" -lt "$c" ] && c=$cnt
+  r=$(( (cnt + COLS - 1) / COLS ))
+  ffmpeg -nostdin -v error -framerate 1 -start_number "$start" -i "$TMP/s_%03d.png" \
+    -vf "tile=${c}x${r}:padding=4:color=black" -frames:v 1 -q:v 4 "$OUT/sheet-$page.jpg" -y
+  SHEETS=$page
+done
+
+{
+  echo "# $LABEL — $TOTAL images"
+  echo
+  echo "Sheets: $(cd "$OUT" && ls sheet-*.jpg | tr '\n' ' ')(tiles numbered to match the table)"
+  [ "$TOTAL" -gt "$MAX" ] && echo "Only the first $MAX are on sheets; open others by name if needed."
+  echo
+  echo "| # | File | Size | On disk |"
+  echo "|---|---|---|---|"
+  cat "$TMP/table"
+} >"$OUT/summary.md"
+echo "$OUT/summary.md"

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# prep-video — turn a video into a one-page summary + two images so Claude
+# reads ~3k tokens instead of ~50k+ of raw frames.
+#
+# Usage: prep-video <video> [out_dir]
+# Output (default ./.prep/<name>/):
+#   summary.md      what Claude reads first
+#   sheet.jpg       one frame per scene, timestamped, tiled
+#   hook.jpg        the first 2 seconds, 4 frames
+#   transcript.txt  timestamped transcript (if a Whisper is installed)
+#
+# Needs ffmpeg/ffprobe. Optional: faster-whisper / mlx-whisper / openai-whisper
+# for transcripts; tesseract or macOS Vision (mac/vision.swift) for on-screen text.
+# Works with macOS's stock bash 3.2.
+
+set -euo pipefail
+
+die() { echo "prep-video: $*" >&2; exit 1; }
+[ $# -ge 1 ] || die "usage: prep-video <video> [out_dir]"
+command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || die "needs ffmpeg + ffprobe (brew install ffmpeg)"
+
+SRC=$1
+[ -f "$SRC" ] || die "no such file: $SRC"
+# resolve symlinks (e.g. ~/bin/prep-video -> repo) so lib/ and mac/ are found
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+HERE=$(cd "$(dirname "$SELF")" && pwd)
+NAME=$(basename "$SRC"); NAME=${NAME%.*}
+OUT=${2:-./.prep/$NAME}
+mkdir -p "$OUT"
+rm -f "$OUT/summary.md" "$OUT/sheet.jpg" "$OUT/hook.jpg" "$OUT/transcript.txt"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+SCENE_THRESHOLD=${SCENE_THRESHOLD:-0.3}
+
+# ---------- probe ----------
+probe() { ffprobe -v error -select_streams "$1" -show_entries "$2" -of default=nw=1:nk=1 "$SRC" | head -1; }
+DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SRC")
+W=$(probe v:0 stream=width); H=$(probe v:0 stream=height)
+FPS_RAW=$(probe v:0 stream=r_frame_rate)
+VCODEC=$(probe v:0 stream=codec_name)
+ACODEC=$(probe a:0 stream=codec_name || true)
+FPS=$(awk -v r="$FPS_RAW" 'BEGIN{split(r,a,"/"); if(a[2]==0)a[2]=1; printf "%.3g", a[1]/a[2]}')
+SIZE_MB=$(awk -v b="$(wc -c <"$SRC")" 'BEGIN{printf "%.1f", b/1048576}')
+fmt_t() { awk -v s="$1" 'BEGIN{s=int(s+0.5); printf "%d:%02d", s/60, s%60}'; }
+
+# ---------- scenes ----------
+CUTS=0; SCENES=0; NF=0; : >"$TMP/cuts"; : >"$TMP/ts"
+if [ -n "$W" ]; then
+# Cut times where the picture changes by more than SCENE_THRESHOLD.
+ffmpeg -nostdin -hide_banner -nostats -i "$SRC" -an \
+  -vf "select='gt(scene,$SCENE_THRESHOLD)',showinfo" -f null - 2>"$TMP/scenes.log" || true
+grep -o 'pts_time:[0-9.]*' "$TMP/scenes.log" | cut -d: -f2 >"$TMP/cuts" || true
+CUTS=$(wc -l <"$TMP/cuts" | tr -d ' ')
+SCENES=$((CUTS + 1))
+
+# Layout: vertical video -> 6 columns of 200px; horizontal -> 4 columns of 320px.
+# Keeps the sheet under ~1600px so Claude doesn't downscale it.
+if [ "$H" -gt "$W" ]; then TW=200; COLS=6; MAXF=18; else TW=320; COLS=4; MAXF=20; fi
+TH=$(awk -v w="$W" -v h="$H" -v tw="$TW" 'BEGIN{t=int(tw*h/w); print t-(t%2)}')
+
+# One frame a beat after each cut (skips transition frames), merged with evenly
+# spaced frames (~1 per 5s, at least 6) so one-take videos still get coverage.
+# Frames closer than 1.5s are dropped, then the list is thinned evenly to MAXF.
+TARGET=$(awk -v d="$DUR" -v m="$MAXF" 'BEGIN{n=int(d/5); if(n<6)n=6; if(n>m)n=m; print n}')
+{
+  echo 0.300
+  awk -v d="$DUR" '{t=$1+0.4; if(t<d-0.2) printf "%.3f\n", t}' "$TMP/cuts"
+  awk -v d="$DUR" -v n="$TARGET" 'BEGIN{for(i=1;i<n;i++) printf "%.3f\n", 0.3+i*(d-0.6)/(n-1)}'
+} | sort -n | awk 'NR==1||$1-last>=1.5{print; last=$1}' >"$TMP/ts_all"
+N_ALL=$(wc -l <"$TMP/ts_all" | tr -d ' ')
+if [ "$N_ALL" -gt "$MAXF" ]; then
+  awk -v n="$N_ALL" -v m="$MAXF" '{a[NR]=$1} END{for(i=0;i<m;i++) print a[int(i*(n-1)/(m-1))+1]}' "$TMP/ts_all" >"$TMP/ts"
+else
+  cp "$TMP/ts_all" "$TMP/ts"
+fi
+NF=$(wc -l <"$TMP/ts" | tr -d ' ')
+
+# drawtext needs a font; fall back to unlabeled tiles if it isn't available.
+LABEL_OK=1
+ffmpeg -nostdin -v error -f lavfi -i color=black:s=64x64 -frames:v 1 \
+  -vf "drawtext=text=x:fontcolor=white" -f null - 2>/dev/null || LABEL_OK=0
+
+i=0
+while read -r t; do
+  i=$((i + 1)); n=$(printf %03d "$i")
+  # full-res frame kept in TMP for OCR, small labeled tile for the sheet
+  ffmpeg -nostdin -v error -ss "$t" -i "$SRC" -frames:v 1 -q:v 3 "$TMP/full_$n.jpg" -y
+  vf="scale=$TW:$TH"
+  [ "$LABEL_OK" = 1 ] && vf="$vf,drawtext=text='$(fmt_t "$t" | sed 's/:/\\:/')':x=6:y=h-th-6:fontsize=16:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=3"
+  ffmpeg -nostdin -v error -i "$TMP/full_$n.jpg" -vf "$vf" "$TMP/tile_$n.png" -y
+done <"$TMP/ts"
+
+ROWS=$(( (NF + COLS - 1) / COLS ))
+[ "$NF" -lt "$COLS" ] && COLS=$NF
+ffmpeg -nostdin -v error -framerate 1 -i "$TMP/tile_%03d.png" \
+  -vf "tile=${COLS}x${ROWS}:padding=4:color=black" -frames:v 1 -q:v 4 "$OUT/sheet.jpg" -y
+
+# ---------- hook: first 2 seconds ----------
+j=0
+for t in 0 0.66 1.33 1.95; do
+  j=$((j + 1))
+  ffmpeg -nostdin -v error -ss "$t" -i "$SRC" -frames:v 1 -vf "scale=$TW:$TH" "$TMP/hook_$j.png" -y
+done
+ffmpeg -nostdin -v error -framerate 1 -i "$TMP/hook_%d.png" -vf "tile=4x1:padding=4:color=black" \
+  -frames:v 1 -q:v 4 "$OUT/hook.jpg" -y
+fi  # video
+
+# ---------- audio ----------
+LUFS="n/a"; PEAK="n/a"; SILENCES="n/a"
+if [ -n "$ACODEC" ]; then
+  ffmpeg -nostdin -hide_banner -nostats -i "$SRC" -vn -af ebur128=peak=true -f null - 2>"$TMP/ebu.log" || true
+  LUFS=$(awk '/Integrated loudness:/{f=1} f&&/I:/{print $2; exit}' "$TMP/ebu.log")
+  PEAK=$(awk '/True peak:/{f=1} f&&/Peak:/{print $2; exit}' "$TMP/ebu.log")
+  ffmpeg -nostdin -hide_banner -nostats -i "$SRC" -vn -af silencedetect=n=-35dB:d=0.6 -f null - 2>"$TMP/sil.log" || true
+  SILENCES=$(grep -c 'silence_end' "$TMP/sil.log" || true)
+fi
+
+# ---------- transcript ----------
+TRANSCRIBER=none
+if [ -n "$ACODEC" ] && [ "${NO_TRANSCRIPT:-0}" != 1 ]; then
+  ffmpeg -nostdin -v error -i "$SRC" -vn -ac 1 -ar 16000 "$TMP/audio.wav" -y
+  if TRANSCRIBER=$(python3 "$HERE/lib/transcribe.py" "$TMP/audio.wav" "$OUT/transcript.txt" 2>"$TMP/whisper.log"); then
+    :
+  else
+    TRANSCRIBER=none; rm -f "$OUT/transcript.txt"
+  fi
+fi
+
+WORDS=0; WPM="n/a"; FIRST=""; LAST=""
+if [ -s "$OUT/transcript.txt" ]; then
+  # lines look like: [0:03] text
+  WORDS=$(sed 's/^\[[0-9:]*\] //' "$OUT/transcript.txt" | wc -w | tr -d ' ')
+  WPM=$(awk -v w="$WORDS" -v d="$DUR" 'BEGIN{printf "%d", w/(d/60)}')
+  FIRST=$(head -1 "$OUT/transcript.txt" | sed 's/^\[[0-9:]*\] //')
+  LAST=$(tail -1 "$OUT/transcript.txt" | sed 's/^\[[0-9:]*\] //')
+fi
+
+# ---------- on-screen text ----------
+OCR_TOOL=none
+: >"$TMP/ocr.txt"
+if [ "$NF" = 0 ] || [ "${NO_OCR:-0}" = 1 ]; then
+  :
+elif [ "$(uname)" = Darwin ] && { command -v vision >/dev/null || command -v swift >/dev/null; }; then
+  OCR_TOOL="macOS Vision"
+  if command -v vision >/dev/null; then VISION=(vision); else VISION=(swift "$HERE/../mac/vision.swift"); fi
+  for f in "$TMP"/full_*.jpg; do "${VISION[@]}" ocr "$f" 2>/dev/null | tr '\n' ' ' >>"$TMP/ocr.txt"; echo >>"$TMP/ocr.txt"; done
+elif command -v tesseract >/dev/null; then
+  OCR_TOOL=tesseract
+  for f in "$TMP"/full_*.jpg; do tesseract "$f" - 2>/dev/null | tr '\n' ' ' >>"$TMP/ocr.txt"; echo >>"$TMP/ocr.txt"; done
+fi
+
+# ---------- token estimate ----------
+# Claude images cost ~ w*h/750 tokens after being fit inside 1568px / 1.15MP.
+img_tokens() {
+  ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x "$1" | awk -Fx '{
+    w=$1; h=$2; s=1; if (w>1568||h>1568) s=1568/(w>h?w:h); w*=s; h*=s;
+    a=w*h; if (a>1150000) { s=sqrt(1150000/a); w*=s; h*=s } printf "%d", w*h/750 }'
+}
+SHEET_TOK=0; HOOK_TOK=0; FRAME_TOK=0; BEFORE=0
+if [ -n "$W" ]; then
+FRAME_TOK=$(awk -v w="$W" -v h="$H" 'BEGIN{s=1; if (w>1568||h>1568) s=1568/(w>h?w:h); w*=s; h*=s;
+  a=w*h; if (a>1150000) { s=sqrt(1150000/a); w*=s; h*=s } printf "%d", w*h/750}')
+BEFORE=$(awk -v d="$DUR" -v f="$FRAME_TOK" 'BEGIN{printf "%d", int(d+0.999)*f}')
+SHEET_TOK=$(img_tokens "$OUT/sheet.jpg"); HOOK_TOK=$(img_tokens "$OUT/hook.jpg")
+fi
+
+# ---------- summary ----------
+{
+  echo "# $NAME"
+  echo
+  echo "| | |"
+  echo "|---|---|"
+  echo "| Length | $(fmt_t "$DUR") (${DUR%.*}s) |"
+  if [ -n "$W" ]; then
+    echo "| Picture | ${W}x${H} ${VCODEC} @ ${FPS}fps, ${SIZE_MB} MB |"
+    echo "| Scenes | $SCENES ($CUTS cuts, threshold $SCENE_THRESHOLD) |"
+  else
+    echo "| File | audio only, ${ACODEC}, ${SIZE_MB} MB |"
+  fi
+  echo "| Loudness | ${LUFS} LUFS integrated, ${PEAK} dBTP peak |"
+  echo "| Pauses >0.6s | $SILENCES |"
+  echo "| Words | $WORDS ($WPM a minute) |"
+  [ -n "$FIRST" ] && echo "| First line | \"$FIRST\" |"
+  [ -n "$LAST" ]  && echo "| Last line | \"$LAST\" |"
+  [ -n "$W" ] && echo "| Images | sheet.jpg ($NF frames: scene changes + every ~$(awk -v d="$DUR" -v n="$TARGET" 'BEGIN{printf "%d", d/n}')s, timestamped), hook.jpg (first 2s) |"
+  if [ -z "$W" ]; then
+    :
+  elif [ "$CUTS" -gt 0 ]; then
+    echo; echo "## Scene cuts"
+    awk '{s=int($1+0.5); printf "%d:%02d ", s/60, s%60}' "$TMP/cuts" | fold -s -w 100; echo
+  else
+    echo; echo "## Scene cuts"; echo "none detected"
+  fi
+  if [ -s "$TMP/ocr.txt" ] && grep -q '[A-Za-z]' "$TMP/ocr.txt"; then
+    echo
+    echo "## On-screen text by sheet frame ($OCR_TOOL)"
+    k=0
+    while read -r t && read -r line <&3; do
+      k=$((k + 1))
+      line=$(echo "$line" | tr -s ' ' | cut -c1-160)
+      if [ -n "${line// }" ]; then echo "- $(fmt_t "$t"): $line"; fi
+    done <"$TMP/ts" 3<"$TMP/ocr.txt"
+  fi
+  echo
+  echo "## Transcript"
+  if [ -s "$OUT/transcript.txt" ]; then
+    echo "transcript.txt ($TRANSCRIBER). Read it only if the task needs the words."
+  else
+    echo "none (no audio, or no Whisper installed — see README)"
+  fi
+} >"$TMP/summary.md"
+# ~4 chars a token for text; +40 for the estimate lines appended below
+TEXT_TOK=$(( $(wc -c <"$TMP/summary.md" | tr -d ' ') / 4 + 40 ))
+AFTER=$((TEXT_TOK + SHEET_TOK + HOOK_TOK))
+[ -n "$W" ] && {
+  echo
+  echo "## Token estimate"
+  echo "- Raw: ~$BEFORE tokens (1 frame/sec at ${FRAME_TOK} tokens each, and still no audio)"
+  echo "- This prep: ~$AFTER tokens (summary ${TEXT_TOK} + sheet ${SHEET_TOK} + hook ${HOOK_TOK})"
+} >>"$TMP/summary.md"
+mv "$TMP/summary.md" "$OUT/summary.md"
+
+echo "$OUT/summary.md"
